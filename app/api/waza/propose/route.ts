@@ -1,7 +1,7 @@
 import Anthropic from '@anthropic-ai/sdk'
 import { NextRequest, NextResponse } from 'next/server'
 
-export const maxDuration = 120
+export const maxDuration = 300
 
 interface PreFilledRow {
   no: number
