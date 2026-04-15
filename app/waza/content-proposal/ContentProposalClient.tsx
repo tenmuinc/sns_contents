@@ -1,5 +1,6 @@
 'use client'
 
+import { upload } from '@vercel/blob/client'
 import { useEffect, useRef, useState } from 'react'
 
 // ─── 型定義 ───────────────────────────────────────────────────────────────────
@@ -202,14 +203,6 @@ export default function ContentProposalClient() {
     )
   }
 
-  const readFileAsBase64 = (file: File): Promise<string> =>
-    new Promise((resolve, reject) => {
-      const reader = new FileReader()
-      reader.onload = () => resolve((reader.result as string).split(',')[1])
-      reader.onerror = reject
-      reader.readAsDataURL(file)
-    })
-
   const handlePropose = async (keepApproved = false) => {
     setProposing(true)
     setProposeError('')
@@ -218,9 +211,17 @@ export default function ContentProposalClient() {
       setApprovedNos(new Set())
     }
     try {
-      const reportBase64List = await Promise.all(
-        reportFiles.map(async (f) => ({ name: f.name, base64: await readFileAsBase64(f) }))
+      // PDFを Vercel Blob にアップロードしてURLを取得（ペイロードサイズ制限回避）
+      const reportBlobUrls = await Promise.all(
+        reportFiles.map(async (f) => {
+          const blob = await upload(f.name, f, {
+            access: 'public',
+            handleUploadUrl: '/api/waza/upload-pdf',
+          })
+          return { name: f.name, url: blob.url }
+        })
       )
+
       const approvedRows = keepApproved && result
         ? result.proposals.filter((p) => approvedNos.has(p.no))
         : []
@@ -235,7 +236,7 @@ export default function ContentProposalClient() {
           feedCount: totalFeed,
           reelCount: totalReel,
           previousContent,
-          reportBase64List,
+          reportBlobUrls,
           preFilledRows,
           approvedRows,
           globalNote,

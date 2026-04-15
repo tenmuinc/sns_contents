@@ -1,4 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk'
+import { del } from '@vercel/blob'
 import { NextRequest, NextResponse } from 'next/server'
 
 export const maxDuration = 300
@@ -30,10 +31,13 @@ interface ProposeRequest {
   feedCount: number
   reelCount: number
   previousContent: string
-  reportBase64List: { name: string; base64: string }[]
+  /** 旧方式（後方互換）: base64埋め込み */
+  reportBase64List?: { name: string; base64: string }[]
+  /** 新方式: Vercel Blob にアップロード済みのURL一覧 */
+  reportBlobUrls?: { name: string; url: string }[]
   preFilledRows: PreFilledRow[]
   approvedRows?: ApprovedRow[]
-  globalNote?: string   // 今回全体の注意点
+  globalNote?: string
 }
 
 export async function POST(req: NextRequest) {
@@ -46,11 +50,26 @@ export async function POST(req: NextRequest) {
   const body: ProposeRequest = await req.json()
   const {
     clientName, targetMonths, totalPosts, feedCount, reelCount,
-    previousContent, reportBase64List, preFilledRows, approvedRows = [],
-    globalNote = '',
+    previousContent, reportBase64List, reportBlobUrls, preFilledRows,
+    approvedRows = [], globalNote = '',
   } = body
 
   const anthropic = new Anthropic({ apiKey })
+
+  // Blob URLs → base64 変換（新方式）。終わったら Blob から削除。
+  let resolvedReports: { name: string; base64: string }[] = reportBase64List ?? []
+  if (reportBlobUrls && reportBlobUrls.length > 0) {
+    resolvedReports = await Promise.all(
+      reportBlobUrls.map(async ({ name, url }) => {
+        const res = await fetch(url)
+        const buf = await res.arrayBuffer()
+        const base64 = Buffer.from(buf).toString('base64')
+        return { name, base64 }
+      })
+    )
+    // 使い終わったら Blob ストレージから削除
+    await Promise.allSettled(reportBlobUrls.map(({ url }) => del(url)))
+  }
 
   const monthStr = targetMonths
     .sort()
@@ -65,7 +84,7 @@ export async function POST(req: NextRequest) {
     citations: { enabled: boolean }
   }
 
-  const pdfBlocks: DocumentBlock[] = reportBase64List.map((r) => ({
+  const pdfBlocks: DocumentBlock[] = resolvedReports.map((r) => ({
     type: 'document' as const,
     source: { type: 'base64' as const, media_type: 'application/pdf' as const, data: r.base64 },
     title: r.name,
