@@ -37,6 +37,7 @@ interface ProposeRequest {
 }
 
 export async function POST(req: NextRequest) {
+  try {
   const apiKey = process.env.ANTHROPIC_API_KEY
   if (!apiKey) {
     return NextResponse.json({ error: 'ANTHROPIC_API_KEY が設定されていません' }, { status: 500 })
@@ -188,4 +189,8 @@ ${freeSection}
 
   const parsed = JSON.parse(jsonMatch[1])
   return NextResponse.json(parsed)
+  } catch (e) {
+    console.error('propose error:', e)
+    return NextResponse.json({ error: String(e) }, { status: 500 })
+  }
 }

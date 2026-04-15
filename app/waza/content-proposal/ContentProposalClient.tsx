@@ -241,7 +241,13 @@ export default function ContentProposalClient() {
           globalNote,
         }),
       })
-      const data: ProposeResponse & { error?: string } = await res.json()
+      const text = await res.text()
+      let data: ProposeResponse & { error?: string }
+      try {
+        data = JSON.parse(text)
+      } catch {
+        throw new Error(`サーバーエラー: ${text.slice(0, 200)}`)
+      }
       if (!res.ok || data.error) throw new Error(data.error ?? '提案生成に失敗しました')
       setResult(data)
     } catch (e) {
