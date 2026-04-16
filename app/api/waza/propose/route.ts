@@ -1,6 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk'
 import { del } from '@vercel/blob'
-import { NextRequest, NextResponse } from 'next/server'
+import { NextRequest } from 'next/server'
 
 export const maxDuration = 300
 
@@ -31,9 +31,7 @@ interface ProposeRequest {
   feedCount: number
   reelCount: number
   previousContent: string
-  /** 旧方式（後方互換）: base64埋め込み */
   reportBase64List?: { name: string; base64: string }[]
-  /** 新方式: Vercel Blob にアップロード済みのURL一覧 */
   reportBlobUrls?: { name: string; url: string }[]
   preFilledRows: PreFilledRow[]
   approvedRows?: ApprovedRow[]
@@ -41,97 +39,108 @@ interface ProposeRequest {
 }
 
 export async function POST(req: NextRequest) {
-  try {
-  const apiKey = process.env.ANTHROPIC_API_KEY
-  if (!apiKey) {
-    return NextResponse.json({ error: 'ANTHROPIC_API_KEY が設定されていません' }, { status: 500 })
-  }
+  const encoder = new TextEncoder()
 
-  const body: ProposeRequest = await req.json()
-  const {
-    clientName, targetMonths, totalPosts, feedCount, reelCount,
-    previousContent, reportBase64List, reportBlobUrls, preFilledRows,
-    approvedRows = [], globalNote = '',
-  } = body
+  const stream = new ReadableStream({
+    async start(controller) {
+      const send = (data: object) => {
+        try {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`))
+        } catch {
+          // controller already closed
+        }
+      }
 
-  const anthropic = new Anthropic({ apiKey })
+      try {
+        const apiKey = process.env.ANTHROPIC_API_KEY
+        if (!apiKey) {
+          send({ status: 'error', error: 'ANTHROPIC_API_KEY が設定されていません' })
+          controller.close()
+          return
+        }
 
-  // Blob URLs → base64 変換（新方式）。終わったら Blob から削除。
-  let resolvedReports: { name: string; base64: string }[] = reportBase64List ?? []
-  if (reportBlobUrls && reportBlobUrls.length > 0) {
-    resolvedReports = await Promise.all(
-      reportBlobUrls.map(async ({ name, url }) => {
-        const res = await fetch(url)
-        const buf = await res.arrayBuffer()
-        const base64 = Buffer.from(buf).toString('base64')
-        return { name, base64 }
-      })
-    )
-    // 使い終わったら Blob ストレージから削除
-    await Promise.allSettled(reportBlobUrls.map(({ url }) => del(url)))
-  }
+        const body: ProposeRequest = await req.json()
+        const {
+          clientName, targetMonths, totalPosts, feedCount, reelCount,
+          previousContent, reportBase64List, reportBlobUrls, preFilledRows,
+          approvedRows = [], globalNote = '',
+        } = body
 
-  const monthStr = targetMonths
-    .sort()
-    .map((m) => { const [y, mo] = m.split('-'); return `${y}年${parseInt(mo)}月` })
-    .join('・')
+        const anthropic = new Anthropic({ apiKey })
 
-  type DocumentBlock = {
-    type: 'document'
-    source: { type: 'base64'; media_type: 'application/pdf'; data: string }
-    title: string
-    context: string
-    citations: { enabled: boolean }
-  }
+        // Blob URLs → base64 変換
+        send({ status: 'processing', message: 'PDFを読み込み中...' })
+        let resolvedReports: { name: string; base64: string }[] = reportBase64List ?? []
+        if (reportBlobUrls && reportBlobUrls.length > 0) {
+          resolvedReports = await Promise.all(
+            reportBlobUrls.map(async ({ name, url }) => {
+              const res = await fetch(url)
+              const buf = await res.arrayBuffer()
+              const base64 = Buffer.from(buf).toString('base64')
+              return { name, base64 }
+            })
+          )
+          await Promise.allSettled(reportBlobUrls.map(({ url }) => del(url)))
+        }
 
-  const pdfBlocks: DocumentBlock[] = resolvedReports.map((r) => ({
-    type: 'document' as const,
-    source: { type: 'base64' as const, media_type: 'application/pdf' as const, data: r.base64 },
-    title: r.name,
-    context: '過去のInstagramレポート。エンゲージメント率・リーチ・保存数・いいね数などのデータが含まれます。',
-    citations: { enabled: true },
-  }))
+        const monthStr = targetMonths
+          .sort()
+          .map((m) => { const [y, mo] = m.split('-'); return `${y}年${parseInt(mo)}月` })
+          .join('・')
 
-  // 生成対象の行（承認済みを除く）
-  const approvedNos = new Set(approvedRows.map((r) => r.no))
-  const targetRows = preFilledRows.filter((r) => !approvedNos.has(r.no))
-  const targetTotal = targetRows.length
-  const targetFeed = targetRows.filter((r) => r.type === 'フィード').length
-  const targetReel = targetRows.filter((r) => r.type === 'リール').length
+        type DocumentBlock = {
+          type: 'document'
+          source: { type: 'base64'; media_type: 'application/pdf'; data: string }
+          title: string
+          context: string
+          citations: { enabled: boolean }
+        }
 
-  const specifiedRows = targetRows.filter((r) => r.product.trim() !== '')
-  const freeRows = targetRows.filter((r) => r.product.trim() === '')
+        const pdfBlocks: DocumentBlock[] = resolvedReports.map((r) => ({
+          type: 'document' as const,
+          source: { type: 'base64' as const, media_type: 'application/pdf' as const, data: r.base64 },
+          title: r.name,
+          context: '過去のInstagramレポート。エンゲージメント率・リーチ・保存数・いいね数などのデータが含まれます。',
+          citations: { enabled: true },
+        }))
 
-  const approvedSection = approvedRows.length > 0
-    ? `【承認済み（変更不要・そのまま出力すること）】
-${approvedRows.map((r) => `No.${r.no} [${r.type}] 商品:${r.product} / テーマ:${r.theme}`).join('\n')}`
-    : ''
+        const approvedNos = new Set(approvedRows.map((r) => r.no))
+        const targetRows = preFilledRows.filter((r) => !approvedNos.has(r.no))
+        const targetTotal = targetRows.length
+        const targetFeed = targetRows.filter((r) => r.type === 'フィード').length
+        const targetReel = targetRows.filter((r) => r.type === 'リール').length
 
-  const noteSection = globalNote.trim()
-    ? `【今回全体の注意点（必ず守ること）】\n${globalNote.trim()}`
-    : ''
+        const specifiedRows = targetRows.filter((r) => r.product.trim() !== '')
+        const freeRows = targetRows.filter((r) => r.product.trim() === '')
 
-  const specifiedSection = specifiedRows.length > 0
-    ? `【商品指定あり（この商品でコンテンツを考える）】
-${specifiedRows.map((r) => {
-    let line = `No.${r.no} [${r.type}] 商品: ${r.product}`
-    if (r.productUrl) line += ` URL: ${r.productUrl}`
-    if (r.productDesc) line += ` 説明: ${r.productDesc}`
-    if (r.rowNote) line += ` ※注意点: ${r.rowNote}`
-    return line
-  }).join('\n')}`
-    : ''
+        const approvedSection = approvedRows.length > 0
+          ? `【承認済み（変更不要・そのまま出力すること）】\n${approvedRows.map((r) => `No.${r.no} [${r.type}] 商品:${r.product} / テーマ:${r.theme}`).join('\n')}`
+          : ''
 
-  const freeRowsWithNotes = freeRows.filter((r) => r.rowNote.trim())
-  const rowNotesSection = freeRowsWithNotes.length > 0
-    ? `【各投稿の個別注意点】\n${freeRowsWithNotes.map((r) => `No.${r.no}: ${r.rowNote}`).join('\n')}`
-    : ''
+        const noteSection = globalNote.trim()
+          ? `【今回全体の注意点（必ず守ること）】\n${globalNote.trim()}`
+          : ''
 
-  const freeSection = freeRows.length > 0
-    ? `【商品指定なし（No.${freeRows.map((r) => r.no).join('・')} は商品・内容ともに自由に提案）】`
-    : ''
+        const specifiedSection = specifiedRows.length > 0
+          ? `【商品指定あり（この商品でコンテンツを考える）】\n${specifiedRows.map((r) => {
+              let line = `No.${r.no} [${r.type}] 商品: ${r.product}`
+              if (r.productUrl) line += ` URL: ${r.productUrl}`
+              if (r.productDesc) line += ` 説明: ${r.productDesc}`
+              if (r.rowNote) line += ` ※注意点: ${r.rowNote}`
+              return line
+            }).join('\n')}`
+          : ''
 
-  const systemPrompt = `あなたはInstagramマーケティングの専門家です。
+        const freeRowsWithNotes = freeRows.filter((r) => r.rowNote.trim())
+        const rowNotesSection = freeRowsWithNotes.length > 0
+          ? `【各投稿の個別注意点】\n${freeRowsWithNotes.map((r) => `No.${r.no}: ${r.rowNote}`).join('\n')}`
+          : ''
+
+        const freeSection = freeRows.length > 0
+          ? `【商品指定なし（No.${freeRows.map((r) => r.no).join('・')} は商品・内容ともに自由に提案）】`
+          : ''
+
+        const systemPrompt = `あなたはInstagramマーケティングの専門家です。
 クライアントの過去レポートと前回コンテンツを分析し、次回投稿コンテンツを提案します。
 
 【絶対に守るルール】
@@ -145,7 +154,7 @@ ${specifiedRows.map((r) => {
 5. 必ずJSON形式のみで返す（説明文・前置き・バッククォートなし）。
 6. フィードとリールを明確に区別し、指定の番号・種別を厳守する。`
 
-  const userPrompt = `クライアント: ${clientName}
+        const userPrompt = `クライアント: ${clientName}
 対象月: ${monthStr}
 全体の投稿数: 合計${totalPosts}件（フィード${feedCount}件・リール${reelCount}件）
 今回生成する件数: ${targetTotal}件（フィード${targetFeed}件・リール${targetReel}件）
@@ -177,39 +186,68 @@ ${freeSection}
   "overview": "全体的な提案方針と前回からの差別化ポイント（200字程度）"
 }`
 
-  const response = await anthropic.messages.create({
-    model: 'claude-opus-4-6',
-    max_tokens: 8000,
-    system: systemPrompt,
-    messages: [
-      {
-        role: 'user',
-        content: [
-          ...(pdfBlocks.length > 0 ? pdfBlocks : []),
-          { type: 'text', text: userPrompt },
-        ],
-      },
-    ],
+        // Claude にストリーミングで投げて進捗を送る
+        send({ status: 'processing', message: 'AIが提案を生成中...' })
+
+        let fullText = ''
+        let lastProgressAt = 0
+
+        const aiStream = anthropic.messages.stream({
+          model: 'claude-opus-4-6',
+          max_tokens: 8000,
+          system: systemPrompt,
+          messages: [
+            {
+              role: 'user',
+              content: [
+                ...(pdfBlocks.length > 0 ? pdfBlocks : []),
+                { type: 'text', text: userPrompt },
+              ],
+            },
+          ],
+        })
+
+        for await (const event of aiStream) {
+          if (
+            event.type === 'content_block_delta' &&
+            event.delta.type === 'text_delta'
+          ) {
+            fullText += event.delta.text
+            // 200文字ごとに進捗を送信（接続維持 + 進捗表示）
+            if (fullText.length - lastProgressAt >= 200) {
+              lastProgressAt = fullText.length
+              send({ status: 'processing', message: `AIが提案を生成中... (${fullText.length}文字)` })
+            }
+          }
+        }
+
+        // JSON パース
+        const jsonMatch =
+          fullText.match(/```(?:json)?\s*([\s\S]*?)```/) ??
+          fullText.match(/(\{[\s\S]*\})/)
+        if (!jsonMatch) {
+          send({ status: 'error', error: 'Claudeからの応答をパースできませんでした', raw: fullText.slice(0, 500) })
+          controller.close()
+          return
+        }
+
+        const parsed = JSON.parse(jsonMatch[1])
+        send({ status: 'done', ...parsed })
+        controller.close()
+
+      } catch (e) {
+        console.error('propose stream error:', e)
+        send({ status: 'error', error: String(e) })
+        controller.close()
+      }
+    },
   })
 
-  const rawText = response.content
-    .filter((b): b is Anthropic.TextBlock => b.type === 'text')
-    .map((b) => b.text)
-    .join('')
-
-  const jsonMatch = rawText.match(/```(?:json)?\s*([\s\S]*?)```/) ??
-    rawText.match(/(\{[\s\S]*\})/)
-  if (!jsonMatch) {
-    return NextResponse.json(
-      { error: 'Claudeからの応答をパースできませんでした', raw: rawText },
-      { status: 500 }
-    )
-  }
-
-  const parsed = JSON.parse(jsonMatch[1])
-  return NextResponse.json(parsed)
-  } catch (e) {
-    console.error('propose error:', e)
-    return NextResponse.json({ error: String(e) }, { status: 500 })
-  }
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+    },
+  })
 }

@@ -91,6 +91,7 @@ export default function ContentProposalClient() {
 
   // ── step 4: 提案
   const [proposing, setProposing] = useState(false)
+  const [proposingStatus, setProposingStatus] = useState('')
   const [result, setResult] = useState<ProposeResponse | null>(null)
   const [proposeError, setProposeError] = useState('')
   const [editingCell, setEditingCell] = useState<{ row: number; col: keyof Proposal } | null>(null)
@@ -205,13 +206,14 @@ export default function ContentProposalClient() {
 
   const handlePropose = async (keepApproved = false) => {
     setProposing(true)
+    setProposingStatus('PDFをアップロード中...')
     setProposeError('')
     if (!keepApproved) {
       setResult(null)
       setApprovedNos(new Set())
     }
     try {
-      // PDFを Vercel Blob にアップロードしてURLを取得（ペイロードサイズ制限回避）
+      // PDFを Vercel Blob にアップロードしてURLを取得
       const reportBlobUrls = await Promise.all(
         reportFiles.map(async (f) => {
           const blob = await upload(f.name, f, {
@@ -225,6 +227,8 @@ export default function ContentProposalClient() {
       const approvedRows = keepApproved && result
         ? result.proposals.filter((p) => approvedNos.has(p.no))
         : []
+
+      setProposingStatus('AIに接続中...')
 
       const res = await fetch('/api/waza/propose', {
         method: 'POST',
@@ -242,15 +246,40 @@ export default function ContentProposalClient() {
           globalNote,
         }),
       })
-      const text = await res.text()
-      let data: ProposeResponse & { error?: string }
-      try {
-        data = JSON.parse(text)
-      } catch {
-        throw new Error(`サーバーエラー: ${text.slice(0, 200)}`)
+
+      if (!res.body) throw new Error('ストリーミングレスポンスが取得できませんでした')
+
+      // SSEストリームを読み取る
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+
+        const lines = buffer.split('\n')
+        buffer = lines.pop() ?? ''
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue
+          let data: { status: string; message?: string; error?: string; proposals?: ProposeResponse['proposals']; overview?: string }
+          try {
+            data = JSON.parse(line.slice(6))
+          } catch {
+            continue
+          }
+
+          if (data.status === 'processing') {
+            setProposingStatus(data.message ?? '処理中...')
+          } else if (data.status === 'done') {
+            setResult({ proposals: data.proposals ?? [], overview: data.overview ?? '' })
+          } else if (data.status === 'error') {
+            throw new Error(data.error ?? '提案生成に失敗しました')
+          }
+        }
       }
-      if (!res.ok || data.error) throw new Error(data.error ?? '提案生成に失敗しました')
-      setResult(data)
     } catch (e) {
       setProposeError(e instanceof Error ? e.message : '提案生成に失敗しました')
     } finally {
@@ -810,8 +839,8 @@ export default function ContentProposalClient() {
         <div className="flex flex-col items-center justify-center py-24 gap-5">
           <div className="w-12 h-12 border-4 border-gray-100 border-t-gray-900 rounded-full animate-spin" />
           <div className="text-center">
-            <p className="text-sm font-medium text-gray-700">Claudeが分析・提案中...</p>
-            <p className="text-xs text-gray-400 mt-1">レポートの量によっては1〜2分かかる場合があります</p>
+            <p className="text-sm font-medium text-gray-700">{proposingStatus || 'Claudeが分析・提案中...'}</p>
+            <p className="text-xs text-gray-400 mt-1">レポートの量によっては2〜3分かかる場合があります</p>
           </div>
         </div>
       )}
